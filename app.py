@@ -14,6 +14,8 @@ import json
 import uuid
 import shutil
 import threading
+import re
+import hashlib
 from pathlib import Path
 from io import BytesIO
 from datetime import datetime
@@ -205,19 +207,75 @@ os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['OUTPUT_FOLDER'], exist_ok=True)
 
 jobs = {}
+jobs_lock = threading.Lock()
+
+# Auto-cleanup: remove jobs older than this (seconds)
+JOB_MAX_AGE = 3600  # 1 hour
+
+
+def cleanup_old_jobs():
+    """Remove jobs and their files older than JOB_MAX_AGE"""
+    now = time.time()
+    to_remove = []
+    with jobs_lock:
+        for jid, job in jobs.items():
+            start = job.get('start_time', 0)
+            if start > 0 and (now - start) > JOB_MAX_AGE and job.get('status') in ('completed', 'stopped', 'error'):
+                to_remove.append(jid)
+        for jid in to_remove:
+            del jobs[jid]
+    for jid in to_remove:
+        for folder_key in ('UPLOAD_FOLDER', 'OUTPUT_FOLDER'):
+            d = os.path.join(app.config[folder_key], jid)
+            if os.path.isdir(d):
+                try:
+                    shutil.rmtree(d)
+                except Exception:
+                    pass
+        zip_path = os.path.join(app.config['OUTPUT_FOLDER'], f'{jid}.zip')
+        if os.path.exists(zip_path):
+            try:
+                os.remove(zip_path)
+            except Exception:
+                pass
+    if to_remove:
+        print(f"[CLEANUP] Removed {len(to_remove)} old job(s)")
 
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r') as f:
-            return json.load(f)
+        try:
+            with open(CONFIG_FILE, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"[CONFIG] Error reading config.json: {e}, using defaults")
+            return {}
     return {}
 
 
 def save_config(config):
-    with open(CONFIG_FILE, 'w') as f:
-        json.dump(config, f, indent=2)
+    try:
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(config, f, indent=2)
+    except IOError as e:
+        print(f"[CONFIG] Error saving config.json: {e}")
 
+
+def safe_filename(filename):
+    """
+    Secure filename that preserves Thai/Unicode characters.
+    Falls back to hash if filename becomes empty.
+    """
+    name, ext = os.path.splitext(filename)
+    name = name.replace('/', '').replace('\\', '').replace('\0', '')
+    name = re.sub(r'[<>:"|?*]', '', name)
+    name = name.strip('. ')
+    if not name:
+        name = hashlib.md5(filename.encode('utf-8')).hexdigest()[:12]
+    ext = ext.lower()
+    if ext and not re.match(r'^\\.[a-zA-Z0-9]+$', ext):
+        ext = ''
+    return name + ext
 
 # ========================
 # Core Image Processing
@@ -310,8 +368,12 @@ def process_single_image(image_path, output_path, api_key, engine, use_upscale=F
 
 
 def process_job(job_id, file_paths, api_key, engine, use_upscale=False, upscale_scale=4):
-    job = jobs[job_id]
-    job['status'] = 'processing'
+    # Cleanup old jobs before starting new work
+    cleanup_old_jobs()
+
+    with jobs_lock:
+        job = jobs[job_id]
+        job['status'] = 'processing'
     job['start_time'] = time.time()
     output_dir = os.path.join(app.config['OUTPUT_FOLDER'], job_id)
     os.makedirs(output_dir, exist_ok=True)
@@ -1365,7 +1427,7 @@ def api_process():
         if f.filename:
             ext = os.path.splitext(f.filename)[1].lower()
             if ext in SUPPORTED_FORMATS:
-                fname = secure_filename(f.filename)
+                fname = safe_filename(f.filename)
                 fpath = os.path.join(upload_dir, fname)
                 f.save(fpath)
                 file_paths.append(fpath)
@@ -1373,7 +1435,8 @@ def api_process():
     if not file_paths:
         return jsonify({'error': 'No valid image files'}), 400
 
-    jobs[job_id] = { 'job_id': job_id, 'status': 'queued',
+    with jobs_lock:
+        jobs[job_id] = { 'job_id': job_id, 'status': 'queued',
         'total': len(file_paths), 'success': 0, 'errors': 0,
         'progress': 0, 'current_file': '', 'current_index': 0,
         'elapsed': 0, 'engine': engine,
@@ -1413,15 +1476,19 @@ def api_check_upscaler():
 
 @app.route('/api/status/<job_id>')
 def api_status(job_id):
-    if job_id not in jobs:
+    with jobs_lock:
+        if job_id not in jobs:
+            return jsonify({'error': 'Job not found'}), 404
+        return jsonify(dict(jobs[job_id]))
         return jsonify({'error': 'Job not found'}), 404
     return jsonify(jobs[job_id])
 
 
 @app.route('/api/stop/<job_id>', methods=['POST'])
 def api_stop(job_id):
-    if job_id in jobs:
-        jobs[job_id]['stop'] = True
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id]['stop'] = True
     return jsonify({'ok': True})
 
 
@@ -1454,14 +1521,19 @@ def api_download_zip(job_id):
     return send_file(zip_path, as_attachment=True, download_name=f'POD_Output_{job_id[:15]}.zip')
 
 
+# ========================
+# Initialize upscaler at module level (works with Gunicorn)
+# ========================
+load_upscaler()
+print(f"[INIT] Upscale mode: {UPSCALER_MODE}")
+
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     print("\n" + "=" * 50)
     print("  POD Background Remover - Web App v2")
     print("  AIPassiveLab Theme")
     print("=" * 50)
-    # Pre-load upscaler
-    load_upscaler()
     print(f"\n  Upscale mode: {UPSCALER_MODE}")
     print(f"\n  Open: http://localhost:{port}\n")
     app.run(host='0.0.0.0', port=port, debug=False)
